@@ -325,8 +325,14 @@ jobs:
               "CONTROLLER_URL",
               f"http://{os.environ.get('DOCKER_BRIDGE_IP', '172.17.0.1')}:8666",
           )
-          TOOL_RESULT_CONTEXT_CHARS = 100000 if VERBOSE else 16000
+          # The scored run had verbose off (16k cap) and still reached 136k tokens.
+          # A 100k cap makes that certain. Never send more than 24k chars of one result.
+          TOOL_RESULT_CONTEXT_CHARS = int(os.environ.get("TOOL_RESULT_CONTEXT_CHARS", "24000" if VERBOSE else "12000"))
+          TOOL_RESULT_CONTEXT_CHARS = max(2000, min(TOOL_RESULT_CONTEXT_CHARS, 24000))
           TOOL_RESULT_LOG_CHARS = 500000 if VERBOSE else 8000
+          # ~45k tokens. Leaves room for the tool schema and the completion.
+          CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "180000"))
+          CONTEXT_KEEP_GROUPS = int(os.environ.get("CONTEXT_KEEP_GROUPS", "8"))
 
           TOOLS = [
               {
@@ -388,18 +394,170 @@ jobs:
               if len(s) <= n:
                   return s
               head = n * 2 // 3
-              tail = n - head - 40
+              tail = max(0, n - head - 40)
               return s[:head] + f"\n...[{len(s) - head - tail} chars truncated]...\n" + s[-tail:]
+
+
+          def _msg_chars(m: dict) -> int:
+              return len(json.dumps(m, default=str))
+
+
+          def _shrink_message(m: dict, *, hard: bool) -> dict:
+              """Shorten one history message. Never changes role or tool_call id.
+
+              Idempotent: a message that already carries a prune footer is returned
+              unchanged, so a second pass cannot slice the stub and append another one.
+              """
+              out = dict(m)
+              role = out.get("role")
+              if role == "tool":
+                  c = str(out.get("content") or "")
+                  limit = 1200 if hard else TOOL_RESULT_CONTEXT_CHARS
+                  footer_at = c.rfind("\n[context-pruned from ")
+                  if footer_at != -1 and footer_at >= len(c) - 120 and len(c) <= limit + 200:
+                      return out
+                  if len(c) > limit:
+                      out["content"] = _truncate(c, limit) + f"\n[context-pruned from {len(c)} chars; re-read the file if you need it]"
+                  return out
+              if role == "assistant":
+                  c = out.get("content")
+                  cap = 600 if hard else 4000
+                  if isinstance(c, str) and " chars truncated]" in c[-80:] and len(c) <= cap + 80:
+                      pass
+                  elif isinstance(c, str) and len(c) > cap:
+                      out["content"] = _truncate(c, cap)
+                  tcs = out.get("tool_calls")
+                  if tcs:
+                      new_tcs = []
+                      arg_cap = 240 if hard else 1500
+                      val_cap = 160 if hard else 400
+                      for tc in tcs:
+                          tc = dict(tc)
+                          fn = dict(tc.get("function") or {})
+                          args = fn.get("arguments") or ""
+                          # Already stubbed. The serialized form stays over arg_cap
+                          # (path + clipped content + the flag) and must not be sliced again.
+                          if isinstance(args, str) and '"_arguments_pruned"' in args and len(args) <= 2000:
+                              new_tcs.append(tc)
+                              continue
+                          if isinstance(args, str) and len(args) > arg_cap:
+                              try:
+                                  parsed = json.loads(args)
+                              except Exception:
+                                  parsed = {"_pruned": True, "preview": args[:120]}
+                              if isinstance(parsed, dict):
+                                  for k, v in list(parsed.items()):
+                                      if isinstance(v, str) and len(v) > val_cap:
+                                          parsed[k] = v[: val_cap - 20] + f"...[{len(v)} chars]"
+                                  parsed["_arguments_pruned"] = True
+                                  fn["arguments"] = json.dumps(parsed)
+                              else:
+                                  fn["arguments"] = json.dumps({"_pruned": True, "preview": str(args)[:120]})
+                              tc["function"] = fn
+                          new_tcs.append(tc)
+                      out["tool_calls"] = new_tcs
+                  for k in ("reasoning", "reasoning_content"):
+                      if isinstance(out.get(k), str) and len(out[k]) > 400:
+                          out[k] = out[k][:300] + "...[pruned]"
+                  return out
+              if role == "user" and hard:
+                  c = str(out.get("content") or "")
+                  if len(c) > 800 and " chars truncated]" not in c[-80:]:
+                      out["content"] = _truncate(c, 800)
+              return out
+
+
+          def _split_groups(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
+              """Prefix is the system prompt plus the original task. Every later
+              assistant/user message starts a group; tool results stay with the
+              assistant tool_call that produced them so ids never dangle.
+              """
+              prefix: list[dict] = []
+              i = 0
+              while i < len(messages):
+                  m = messages[i]
+                  if m.get("role") == "system" and not prefix:
+                      prefix.append(m)
+                      i += 1
+                      continue
+                  if m.get("role") == "user" and prefix and not any(x.get("role") == "user" for x in prefix):
+                      prefix.append(m)
+                      i += 1
+                      continue
+                  break
+              groups: list[list[dict]] = []
+              while i < len(messages):
+                  m = messages[i]
+                  if m.get("role") == "tool" and groups:
+                      groups[-1].append(m)
+                      i += 1
+                      continue
+                  groups.append([m])
+                  i += 1
+              return prefix, groups
+
+
+          def prune_messages(messages: list[dict]) -> list[dict]:
+              prefix, groups = _split_groups(messages)
+              if not groups:
+                  return messages
+
+              def pack(keep_full: int) -> list[list[dict]]:
+                  n = len(groups)
+                  out: list[list[dict]] = []
+                  for idx, g in enumerate(groups):
+                      hard = idx < n - max(0, keep_full)
+                      out.append([_shrink_message(m, hard=hard) for m in g])
+                  return out
+
+              def size(gs: list[list[dict]]) -> int:
+                  return sum(_msg_chars(m) for g in gs for m in g) + sum(_msg_chars(m) for m in prefix)
+
+              # Full bodies for the recent window. If that still exceeds the
+              # budget, keep a full body only for the latest group and stub the rest
+              # BEFORE dropping anything, so a short trailing nudge cannot evict
+              # the tool result the model just received.
+              stubbed = pack(CONTEXT_KEEP_GROUPS)
+              if size(stubbed) > CONTEXT_CHAR_BUDGET:
+                  stubbed = pack(1)
+              while len(stubbed) > 1 and size(stubbed) > CONTEXT_CHAR_BUDGET:
+                  stubbed.pop(0)
+              if size(stubbed) > CONTEXT_CHAR_BUDGET:
+                  # pack() always reads the original groups, so this is one shrink, not a shrink of a shrink.
+                  stubbed = pack(0)
+                  while len(stubbed) > 1 and size(stubbed) > CONTEXT_CHAR_BUDGET:
+                      stubbed.pop(0)
+              dropped = len(groups) - len(stubbed)
+              out = list(prefix)
+              for g in stubbed:
+                  out.extend(g)
+              before = sum(_msg_chars(m) for m in messages)
+              after = sum(_msg_chars(m) for m in out)
+              if dropped or after < before - 200 or after > CONTEXT_CHAR_BUDGET:
+                  log.info(
+                      "context prune: chars %d -> %d, groups %d -> %d (dropped %d, budget %d)",
+                      before, after, len(groups), len(stubbed), dropped, CONTEXT_CHAR_BUDGET,
+                  )
+              return out
 
 
           # Set by GonkaToolAgent.run so gonka_chat can persist full I/O
           IO_DUMP_DIR: Path | None = None
           TURN_COUNTER = {"n": 0}
 
+          def _http_retryable(curl_rc: int, http_code: str) -> bool:
+              # curl --retry does not retry HTTP statuses unless --fail is set, and
+              # --fail would hide the body we need. 400 is not retryable.
+              return curl_rc != 0 or http_code in {"429", "500", "502", "503", "504"}
+
+
           def gonka_chat(messages: list[dict[str, Any]], *, tool_choice: str | dict = "auto") -> dict:
+              # Prune a copy. The live list keeps the original tool output so the next
+              # turn stubs from the source, not from a stub.
+              outgoing = prune_messages(messages)
               body = {
                   "model": GONKA_MODEL,
-                  "messages": messages,
+                  "messages": outgoing,
                   "tools": TOOLS,
                   "tool_choice": tool_choice,
                   "max_tokens": 8192,
@@ -415,7 +573,7 @@ jobs:
                   # Also human-readable dump of each message role/content
                   hr = IO_DUMP_DIR / f"turn_{turn_n:04d}_messages.txt"
                   parts = []
-                  for i, m in enumerate(messages):
+                  for i, m in enumerate(outgoing):
                       role = m.get("role")
                       content = m.get("content")
                       tcs = m.get("tool_calls")
@@ -431,70 +589,76 @@ jobs:
                   hr.write_text("\n".join(parts))
                   log.debug("wrote messages dump → %s", hr)
 
-              with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-                  json.dump(body, tf)
-                  payload_path = tf.name
-              out_path = payload_path + ".out"
-              try:
-                  t0 = time.perf_counter()
-                  cmd = [
-                      "curl", "--silent", "--show-error",
-                      "--connect-timeout", "15", "--max-time", "300",
-                      "--retry", "2", "--retry-all-errors",
-                      "-o", out_path, "-w", "%{http_code}",
-                      f"{GONKA_BASE}/chat/completions",
-                      "-H", f"Authorization: Bearer {GONKA_KEY}",
-                      "-H", "Content-Type: application/json",
-                      "-H", "X-Gonka-No-Fallback: true",
-                      "-d", f"@{payload_path}",
-                  ]
-                  log.info(
-                      "Gonka request turn=%s model=%s messages=%d payload_bytes=%d tool_choice=%s",
-                      turn_n, GONKA_MODEL, len(messages), Path(payload_path).stat().st_size, tool_choice,
-                  )
-                  if VERBOSE:
-                      # Log last message summary so the CI log shows flow without opening dumps
-                      last = messages[-1] if messages else {}
-                      log.debug(
-                          "last_message role=%s content_preview=%r tool_calls=%s",
-                          last.get("role"),
-                          (str(last.get("content") or ""))[:500],
-                          bool(last.get("tool_calls")),
+              last_error: Exception | None = None
+              for attempt in range(1, 4):
+                  with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                      json.dump(body, tf)
+                      payload_path = tf.name
+                  out_path = payload_path + ".out"
+                  try:
+                      t0 = time.perf_counter()
+                      cmd = [
+                          "curl", "--silent", "--show-error",
+                          "--connect-timeout", "15", "--max-time", "300",
+                          "--retry", "2", "--retry-all-errors",
+                          "-o", out_path, "-w", "%{http_code}",
+                          f"{GONKA_BASE}/chat/completions",
+                          "-H", f"Authorization: Bearer {GONKA_KEY}",
+                          "-H", "Content-Type: application/json",
+                          "-H", "X-Gonka-No-Fallback: true",
+                          "-d", f"@{payload_path}",
+                      ]
+                      log.info(
+                          "Gonka request turn=%s attempt=%s/3 model=%s messages=%d payload_bytes=%d tool_choice=%s",
+                          turn_n, attempt, GONKA_MODEL, len(outgoing), Path(payload_path).stat().st_size, tool_choice,
                       )
-                  proc = subprocess.run(cmd, capture_output=True, text=True)
-                  dt = time.perf_counter() - t0
-                  code = (proc.stdout or "").strip()
-                  raw = Path(out_path).read_text() if Path(out_path).exists() else ""
-                  log.info(
-                      "Gonka HTTP %s in %.2fs (curl_rc=%s, body_bytes=%d)",
-                      code, dt, proc.returncode, len(raw),
-                  )
-                  if VERBOSE and IO_DUMP_DIR is not None:
-                      resp_path = IO_DUMP_DIR / f"turn_{turn_n:04d}_response.raw.json"
-                      resp_path.write_text(raw)
-                      log.debug("wrote full response → %s (%d bytes)", resp_path, len(raw))
-                  if proc.returncode != 0 or code != "200":
+                      if VERBOSE and attempt == 1:
+                          last = outgoing[-1] if outgoing else {}
+                          log.debug(
+                              "last_message role=%s content_preview=%r tool_calls=%s",
+                              last.get("role"),
+                              (str(last.get("content") or ""))[:500],
+                              bool(last.get("tool_calls")),
+                          )
+                      proc = subprocess.run(cmd, capture_output=True, text=True)
+                      dt = time.perf_counter() - t0
+                      code = (proc.stdout or "").strip()
+                      raw = Path(out_path).read_text() if Path(out_path).exists() else ""
+                      log.info(
+                          "Gonka HTTP %s in %.2fs (curl_rc=%s, body_bytes=%d, attempt=%s)",
+                          code, dt, proc.returncode, len(raw), attempt,
+                      )
+                      if VERBOSE and IO_DUMP_DIR is not None:
+                          resp_path = IO_DUMP_DIR / f"turn_{turn_n:04d}_response_a{attempt}.raw.json"
+                          resp_path.write_text(raw)
+                          log.debug("wrote full response → %s (%d bytes)", resp_path, len(raw))
+                      if proc.returncode == 0 and code == "200":
+                          data = json.loads(raw)
+                          usage = data.get("usage") or {}
+                          log.info(
+                              "usage prompt=%s completion=%s total=%s model=%s",
+                              usage.get("prompt_tokens"), usage.get("completion_tokens"),
+                              usage.get("total_tokens"), data.get("model"),
+                          )
+                          if VERBOSE:
+                              choice = (data.get("choices") or [{}])[0]
+                              msg = choice.get("message") or {}
+                              log.debug("full assistant message JSON:\n%s", json.dumps(msg, indent=2)[:100000])
+                              log.debug("finish_reason=%s", choice.get("finish_reason"))
+                          return data
                       log.error("Gonka failure body=%s", raw[:8000] if VERBOSE else raw[:4000])
                       if proc.stderr:
                           log.error("curl stderr=%s", proc.stderr[:2000])
-                      raise RuntimeError(f"Gonka HTTP {code}: {raw[:800]}")
-                  data = json.loads(raw)
-                  usage = data.get("usage") or {}
-                  log.info(
-                      "usage prompt=%s completion=%s total=%s model=%s",
-                      usage.get("prompt_tokens"), usage.get("completion_tokens"),
-                      usage.get("total_tokens"), data.get("model"),
-                  )
-                  if VERBOSE:
-                      # Full assistant message to log (not truncated when ultra-verbose)
-                      choice = (data.get("choices") or [{}])[0]
-                      msg = choice.get("message") or {}
-                      log.debug("full assistant message JSON:\n%s", json.dumps(msg, indent=2)[:100000])
-                      log.debug("finish_reason=%s", choice.get("finish_reason"))
-                  return data
-              finally:
-                  Path(payload_path).unlink(missing_ok=True)
-                  Path(out_path).unlink(missing_ok=True)
+                      last_error = RuntimeError(f"Gonka HTTP {code}: {raw[:800]}")
+                      if not _http_retryable(proc.returncode, code) or attempt == 3:
+                          raise last_error
+                      delay = 5 * attempt
+                      log.warning("retryable Gonka HTTP %s; sleeping %ss", code or proc.returncode, delay)
+                      time.sleep(delay)
+                  finally:
+                      Path(payload_path).unlink(missing_ok=True)
+                      Path(out_path).unlink(missing_ok=True)
+              raise last_error or RuntimeError("Gonka chat failed")
 
 
           def docker_bash(container_id: str, command: str, timeout_sec: int = 45) -> str:
