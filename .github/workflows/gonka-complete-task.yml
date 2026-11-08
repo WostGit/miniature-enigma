@@ -74,7 +74,10 @@ env:
   TASK_ID: ${{ inputs.task_id || 'v8:human/446124892' }}
   MAX_TURNS: ${{ inputs.max_turns || '300' }}
   AGENT_TIMEOUT: ${{ inputs.agent_timeout || '10800' }}
-  CRIU_ENABLED: ${{ inputs.criu == false && '0' || '1' }}
+  # On push, inputs.criu is null and `null == false` is true, so the old
+  # expression stored 0 and skipped CRIU (run 42519032150). Default on unless
+  # a workflow_dispatch explicitly sets criu to false.
+  CRIU_ENABLED: ${{ (github.event_name != 'workflow_dispatch' || inputs.criu) && '1' || '0' }}
   CRIU_DIR: /var/tmp/criu-turns
   GONKA_VERBOSE: ${{ inputs.verbose == false && '0' || '1' }}
 
@@ -692,6 +695,10 @@ jobs:
                               tc["function"] = fn
                           new_tcs.append(tc)
                       out["tool_calls"] = new_tcs
+                  for k in ("reasoning", "reasoning_content"):
+                      v = out.get(k)
+                      if isinstance(v, str) and len(v) > 400 and not v.endswith("[pruned]"):
+                          out[k] = v[:300] + "...[pruned]"
                   return out
               if role == "user" and hard:
                   c = str(out.get("content") or "")
@@ -769,6 +776,10 @@ jobs:
               }
               TURN_COUNTER["n"] += 1
               turn_n = TURN_COUNTER["n"]
+              log.info(
+                  "Gonka request turn=%s messages=%d outgoing=%d",
+                  turn_n, len(messages), len(outgoing),
+              )
               last_error: Exception | None = None
               for attempt in range(1, 4):
                   with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
@@ -789,16 +800,36 @@ jobs:
                           "-d", f"@{payload_path}",
                       ]
                       proc = subprocess.run(cmd, capture_output=True, text=True)
+                      dt = time.perf_counter() - t0
                       code = (proc.stdout or "").strip()
                       raw = Path(out_path).read_text() if Path(out_path).exists() else ""
+                      log.info(
+                          "Gonka HTTP %s in %.2fs curl_rc=%s body_bytes=%d attempt=%s/3 turn=%s",
+                          code or "-", dt, proc.returncode, len(raw), attempt, turn_n,
+                      )
                       if proc.returncode == 0 and code == "200":
-                          return json.loads(raw)
+                          data = json.loads(raw)
+                          usage = data.get("usage") or {}
+                          choice = (data.get("choices") or [{}])[0]
+                          msg = choice.get("message") or {}
+                          log.info(
+                              "usage prompt=%s completion=%s total=%s finish=%s content_len=%s tool_calls=%s",
+                              usage.get("prompt_tokens"), usage.get("completion_tokens"),
+                              usage.get("total_tokens"), choice.get("finish_reason"),
+                              len(msg.get("content") or ""), len(msg.get("tool_calls") or []),
+                          )
+                          return data
+                      log.error("Gonka failure body=%s", (raw or "")[:2000])
+                      if proc.stderr:
+                          log.error("curl stderr=%s", proc.stderr[:1000])
                       last_error = RuntimeError(f"Gonka HTTP {code}: {raw[:800]}")
                       if not _http_retryable(proc.returncode, code) or attempt == 3:
                           if code in {"429", "500", "502", "503", "504"} or proc.returncode != 0:
                               setattr(last_error, "retryable", True)
                           raise last_error
-                      time.sleep(5 * attempt)
+                      delay = 5 * attempt
+                      log.warning("retryable Gonka HTTP %s; sleeping %ss", code or proc.returncode, delay)
+                      time.sleep(delay)
                   finally:
                       Path(payload_path).unlink(missing_ok=True)
                       Path(out_path).unlink(missing_ok=True)
@@ -808,29 +839,37 @@ jobs:
               timeout_sec = max(1, min(int(timeout_sec or 45), 180))
               client = get_docker_client()
               wrapped = f"timeout {timeout_sec} bash -lc {json.dumps(command)}"
+              t0 = time.perf_counter()
               exit_code, output = client.containers.get(container_id).exec_run(
                   ["bash", "-c", wrapped], workdir="/workspace", demux=False,
               )
+              dt = time.perf_counter() - t0
               text = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
-              return f"exit_code={exit_code}\n{_truncate(text, TOOL_RESULT_CONTEXT_CHARS)}"
+              log.info("bash exit=%s dt=%.2fs cmd=%r", exit_code, dt, command[:200])
+              return f"exit_code={exit_code}\nduration_sec={dt:.2f}\n{_truncate(text, TOOL_RESULT_CONTEXT_CHARS)}"
           
           def docker_write(container_id: str, path: str, content: str) -> str:
               if not path.startswith("/"):
                   path = f"/workspace/{path}"
-              if not path.startswith("/workspace"):
-                  return "error: path must be under /workspace"
+              if not path.startswith("/workspace") or "\n" in path or "\x00" in path:
+                  return "error: path must be a single line under /workspace"
               import base64
               client = get_docker_client()
               b64 = base64.b64encode(content.encode()).decode()
-              cmd = (
-                  f"mkdir -p \"$(dirname {json.dumps(path)[1:-1]})\" && "
-                  f"echo {json.dumps(b64)} | base64 -d > {json.dumps(path)} && "
-                  f"wc -c {json.dumps(path)}"
+              # Path and payload stay in the environment. dirname never sees a
+              # shell-expanded path, so spaces and metacharacters are not parsed.
+              script = (
+                  'mkdir -p -- "$(dirname -- "$WRITE_PATH")" && '
+                  'printf %s "$WRITE_B64" | base64 -d > "$WRITE_PATH" && '
+                  'wc -c -- "$WRITE_PATH"'
               )
               exit_code, output = client.containers.get(container_id).exec_run(
-                  ["bash", "-c", cmd], workdir="/workspace",
+                  ["bash", "-c", script],
+                  workdir="/workspace",
+                  environment={"WRITE_PATH": path, "WRITE_B64": b64},
               )
               out = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
+              log.info("write_file path=%s bytes=%d exit=%s", path, len(content), exit_code)
               return f"exit_code={exit_code} wrote {path} ({len(content)} bytes)\n{out}"
           
           class GonkaToolAgent(Agent):
@@ -865,55 +904,143 @@ jobs:
                       "agent_timeout_seconds": args.agent_timeout_seconds,
                   }
                   
-                  for turn in range(start_turn, MAX_TURNS + 1):
-                      if deadline - time.time() <= 0:
-                          break
-                      persist_turn(turn, cid, messages, deadline, out_dir, resume_extra)
+                  def _append_jsonl(path: Path, row: dict) -> None:
+                      with path.open("a") as fh:
+                          fh.write(json.dumps(row, default=str) + "\n")
+
+                  try:
+                      for turn in range(start_turn, MAX_TURNS + 1):
+                          if deadline - time.time() <= 0:
+                              log.warning("wall-clock timeout before turn %s", turn)
+                              break
+                          log.info("======== TURN %s/%s (%.0fs left) ========", turn, MAX_TURNS, deadline - time.time())
+                          persist_turn(turn, cid, messages, deadline, out_dir, resume_extra)
+                          try:
+                              resp = gonka_chat(messages)
+                          except ResumeAndRestart:
+                              raise
+                          except Exception as exc:
+                              log.exception("Gonka chat failed on turn %s", turn)
+                              _append_jsonl(turns_path, {"turn": turn, "error": "gonka_chat_failed", "retryable": bool(getattr(exc, "retryable", False))})
+                              if CRIU_ENABLED and getattr(exc, "retryable", False):
+                                  raise ResumeAndRestart(f"gonka failed on turn {turn}") from exc
+                              break
+
+                          choice = (resp.get("choices") or [{}])[0]
+                          msg = choice.get("message") or {}
+                          finish = choice.get("finish_reason")
+                          messages.append(msg)
+                          content = (msg.get("content") or "").strip() if isinstance(msg.get("content"), str) else ""
+                          tool_calls = msg.get("tool_calls") or []
+                          log.info("assistant finish_reason=%s content_len=%d tool_calls=%d", finish, len(content), len(tool_calls))
+                          if content:
+                              log.info("assistant content:\n%s", content[:2000])
+                          _append_jsonl(transcript_path, {
+                              "turn": turn, "finish_reason": finish, "content": content[:8000],
+                              "usage": resp.get("usage"),
+                              "tool_calls": [
+                                  {"id": tc.get("id"), "name": (tc.get("function") or {}).get("name"),
+                                   "arguments": _truncate(str((tc.get("function") or {}).get("arguments") or ""), 2000)}
+                                  for tc in tool_calls
+                              ],
+                          })
+
+                          if not tool_calls:
+                              if turn < MAX_TURNS and time.time() < deadline:
+                                  messages.append({"role": "user", "content": "Continue with tools. Call submit_done after /workspace/flag.txt exists."})
+                                  log.info("nudge: no tool_calls")
+                                  continue
+                              break
+
+                          stop = False
+                          for tc in tool_calls:
+                              fn = tc.get("function") or {}
+                              name = fn.get("name") or ""
+                              raw_args = fn.get("arguments") or "{}"
+                              try:
+                                  arguments = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                                  if not isinstance(arguments, dict):
+                                      raise json.JSONDecodeError("tool arguments must be an object", str(raw_args), 0)
+                              except (json.JSONDecodeError, TypeError, ValueError) as e:
+                                  log.warning("bad tool args JSON: %s (%s)", str(raw_args)[:300], e)
+                                  result = f"error: tool arguments are not valid JSON ({e}). Retry the call with valid JSON."
+                                  messages.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": result})
+                                  _append_jsonl(transcript_path, {"turn": turn, "tool": name, "error": "bad_json", "result": result})
+                                  continue
+                              log.info(">>> TOOL %s", name)
+                              try:
+                                  if name == "bash":
+                                      command = arguments.get("command")
+                                      if not command:
+                                          result = "error: bash requires a non-empty command"
+                                      else:
+                                          try:
+                                              timeout_sec = int(arguments.get("timeout_sec") or 45)
+                                          except (TypeError, ValueError):
+                                              timeout_sec = 45
+                                          result = docker_bash(cid, command, timeout_sec)
+                                  elif name == "write_file":
+                                      result = docker_write(cid, arguments.get("path") or "out.txt", arguments.get("content") or "")
+                                  elif name == "submit_done":
+                                      peek = docker_bash(
+                                          cid,
+                                          "wc -c /workspace/flag.txt 2>/dev/null; head -c 200 /workspace/flag.txt 2>/dev/null || true",
+                                          15,
+                                      )
+                                      result = f"acknowledged: {arguments.get('summary', '')}\n{peek}"
+                                      stop = True
+                                  else:
+                                      result = f"unknown tool: {name}"
+                              except Exception as e:
+                                  log.exception("tool %s failed", name)
+                                  result = f"error: tool {name} raised {type(e).__name__}: {e}"
+                              messages.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": result})
+                              _append_jsonl(transcript_path, {"turn": turn, "tool": name, "result": _truncate(result, 20000)})
+                              if stop:
+                                  break
+                          if stop:
+                              mark_done()
+                              return
+                      mark_done()
+                  finally:
                       try:
-                          resp = gonka_chat(messages)
-                      except ResumeAndRestart:
-                          raise
-                      except Exception as exc:
-                          if CRIU_ENABLED and getattr(exc, "retryable", False):
-                              raise ResumeAndRestart(f"gonka failed on turn {turn}") from exc
-                          break
-                      
-                      choice = (resp.get("choices") or [{}])[0]
-                      msg = choice.get("message") or {}
-                      messages.append(msg)
-                      tool_calls = msg.get("tool_calls") or []
-                      
-                      if not tool_calls:
-                          messages.append({"role": "user", "content": "Continue with tools. Call submit_done after /workspace/flag.txt exists."})
-                          continue
-                      
-                      stop = False
-                      for tc in tool_calls:
-                          fn = tc.get("function") or {}
-                          name = fn.get("name") or ""
-                          arguments = json.loads(fn.get("arguments") or "{}")
-                          if name == "bash":
-                              result = docker_bash(cid, arguments.get("command") or "true", int(arguments.get("timeout_sec") or 45))
-                          elif name == "write_file":
-                              result = docker_write(cid, arguments.get("path") or "out.txt", arguments.get("content") or "")
-                          elif name == "submit_done":
-                              result = f"acknowledged: {arguments.get('summary', '')}"
-                              stop = True
-                          else:
-                              result = f"unknown tool: {name}"
-                          messages.append({"role": "tool", "tool_call_id": tc.get("id") or name, "content": result})
-                      if stop:
-                          mark_done()
-                          return
-                  mark_done()
+                          snap = docker_bash(
+                              cid,
+                              "echo '=== /workspace ==='; ls -la /workspace; "
+                              "echo '=== flag? ==='; ls -la /workspace/flag.txt 2>&1; "
+                              "echo '=== head flag ==='; head -c 120 /workspace/flag.txt 2>&1",
+                              30,
+                          )
+                          (log_dir / "final_workspace_snapshot.txt").write_text(snap)
+                          log.info("workspace snapshot written")
+                      except Exception:
+                          log.exception("final snapshot failed")
           
           def emit_summary(task_out: Path) -> None:
               result_path = task_out / "result.json"
               if not result_path.exists():
                   raise SystemExit(2)
               data = json.loads(result_path.read_text())
-              summary = f"task={TASK_ID}\nfamily={FAMILY}\nmodel={GONKA_MODEL}\n"
+              checks = data.get("checks") or []
+              scores = []
+              for c in checks:
+                  if isinstance(c, dict):
+                      scores.append(f"{c.get('name') or c.get('id') or 'check'}={c.get('score')}")
+              passed = any(
+                  isinstance(c, dict) and (
+                      (c.get("score") or 0) > 0 or c.get("passed") or c.get("success")
+                  )
+                  for c in checks
+              )
+              summary = (
+                  f"task={TASK_ID}\nfamily={FAMILY}\nmodel={GONKA_MODEL}\n"
+                  f"checks={len(checks)}\nscores={', '.join(scores) or 'none'}\n"
+                  f"passed={int(passed)}\nerror={data.get('error')}\n"
+                  f"elapsed={data.get('elapsed_time')}\ncriu={int(CRIU_ENABLED)}\n"
+              )
               Path("/tmp/gonka-result-summary.txt").write_text(summary)
+              Path("/tmp/gonka-score.txt").write_text("1\n" if passed else "0\n")
+              print(summary)
           
           def finalize_kept_container(evaluator, cid: str, task_out: Path) -> None:
               container = get_docker_client().containers.get(cid)
@@ -923,7 +1050,13 @@ jobs:
               evaluator._save_metadata(task_out)
               evaluator.collect_outputs(container, outputs)
               result = evaluator.verify()
-              Path(task_out / "result.json").write_text(json.dumps(result, indent=2, default=str))
+              if hasattr(result, "model_dump"):
+                  payload = result.model_dump()
+              elif hasattr(result, "dict"):
+                  payload = result.dict()
+              else:
+                  payload = result
+              (task_out / "result.json").write_text(json.dumps(payload, indent=2, default=str))
               emit_summary(task_out)
           
           def resume_if_needed(evaluator) -> bool:
@@ -973,18 +1106,19 @@ jobs:
                   api_base_url=GONKA_BASE, keep_container=CRIU_ENABLED, use_firewall=True,
               )
               evaluator = with_criu_caps(EvaluatorCls)(config=config)
-              
-              if CRIU_ENABLED:
-                  try:
-                      if resume_if_needed(evaluator):
-                          return
-                  except ResumeAndRestart as exc:
-                      raise SystemExit(RESUME_EXIT)
-              
-              result = evaluator.evaluate(GonkaToolAgent())
+              log.info("CRIU_ENABLED=%s keep_container=%s", CRIU_ENABLED, CRIU_ENABLED)
+
+              try:
+                  if CRIU_ENABLED and resume_if_needed(evaluator):
+                      return
+                  result = evaluator.evaluate(GonkaToolAgent())
+              except ResumeAndRestart as exc:
+                  log.warning("resume requested: %s", exc)
+                  raise SystemExit(RESUME_EXIT) from exc
               result_path = task_out / "result.json"
               if result is not None and not result_path.exists():
-                  result_path.write_text(json.dumps(result, indent=2, default=str))
+                  payload = result.model_dump() if hasattr(result, "model_dump") else result
+                  result_path.write_text(json.dumps(payload, indent=2, default=str))
               emit_summary(task_out)
           
           if __name__ == "__main__":
@@ -1002,6 +1136,7 @@ jobs:
           export CONTROLLER_URL="http://${DOCKER_BRIDGE_IP}:8666"
           export PYTHONPATH="${PWD}/src${PYTHONPATH:+:$PYTHONPATH}"
 
+          echo "CRIU_ENABLED=${CRIU_ENABLED}"
           : > /tmp/gonka-complete.log
           last_turn=""
           stuck=0
@@ -1033,14 +1168,37 @@ jobs:
             fi
           done
 
+          echo "CRIU_ENABLED=$CRIU_ENABLED"
           {
             echo "### Gonka complete-task (Merged Prune + CRIU)"
+            echo "- criu: \`$CRIU_ENABLED\`"
             echo "- runner exit: \`$rc\`"
-            if [[ -f "${CRIU_DIR}/status.jsonl" ]]; then
-              echo "- last criu status: \`$(tail -n 1 "${CRIU_DIR}/status.jsonl")\`"
+            if [[ -f /tmp/gonka-result-summary.txt ]]; then
+              echo
+              echo '```'
+              cat /tmp/gonka-result-summary.txt
+              echo '```'
             fi
+            if [[ -f "${CRIU_DIR}/status.jsonl" ]]; then
+              echo
+              echo "- criu events: \`$(wc -l < "${CRIU_DIR}/status.jsonl")\`"
+              echo '```'
+              tail -n 5 "${CRIU_DIR}/status.jsonl"
+              echo '```'
+            fi
+            echo
+            echo "<details><summary>Last 120 log lines</summary>"
+            echo
+            echo '```'
+            tail -n 120 /tmp/gonka-complete.log || true
+            echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          if [[ -f /tmp/gonka-score.txt && "$(tr -d '[:space:]' < /tmp/gonka-score.txt)" != "1" ]]; then
+            echo "flag check did not pass"
+            exit 1
+          fi
           if [[ "$rc" -ne 0 && ! -f /tmp/gonka-result-summary.txt ]]; then
             exit "$rc"
           fi
