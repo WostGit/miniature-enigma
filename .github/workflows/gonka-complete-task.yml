@@ -771,6 +771,12 @@ jobs:
               return curl_rc != 0 or http_code in {"429", "500", "502", "503", "504"}
           
           def gonka_chat(messages: list[dict[str, Any]], *, tool_choice: str | dict = "auto") -> dict:
+              """Call Gonka with aggressive retries on capacity / transient errors.
+
+              Keeps retrying 429 / upstream_saturated (and other 5xx) with exponential
+              backoff until wall-clock deadline is close or a hard non-retryable error
+              occurs. Goal: ride out capacity saturation until credits / job time run out.
+              """
               outgoing = prune_messages(messages)
               body = {
                   "model": GONKA_MODEL,
@@ -787,7 +793,10 @@ jobs:
                   turn_n, len(messages), len(outgoing),
               )
               last_error: Exception | None = None
-              for attempt in range(1, 4):
+              # Cap attempts high; backoff grows to several minutes. Outer agent
+              # deadline still bounds total wall time.
+              max_attempts = 40
+              for attempt in range(1, max_attempts + 1):
                   with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
                       json.dump(body, tf)
                       payload_path = tf.name
@@ -810,16 +819,21 @@ jobs:
                       code = (proc.stdout or "").strip()
                       raw = Path(out_path).read_text() if Path(out_path).exists() else ""
                       log.info(
-                          "Gonka HTTP %s in %.2fs curl_rc=%s body_bytes=%d attempt=%s/3 turn=%s",
-                          code or "-", dt, proc.returncode, len(raw), attempt, turn_n,
+                          "Gonka HTTP %s in %.2fs curl_rc=%s body_bytes=%d attempt=%s/%s turn=%s",
+                          code or "-", dt, proc.returncode, len(raw), attempt, max_attempts, turn_n,
                       )
-                      if proc.returncode == 0 and code == "200":
-                          data = json.loads(raw)
-                          usage = data.get("usage") or {}
+                      if code == "200":
+                          try:
+                              data = json.loads(raw)
+                          except Exception as exc:
+                              last_error = RuntimeError(f"invalid JSON from Gonka: {exc}: {raw[:400]}")
+                              setattr(last_error, "retryable", True)
+                              raise last_error
                           choice = (data.get("choices") or [{}])[0]
                           msg = choice.get("message") or {}
+                          usage = data.get("usage") or {}
                           log.info(
-                              "usage prompt=%s completion=%s total=%s finish=%s content_len=%s tool_calls=%s",
+                              "Gonka ok prompt=%s completion=%s total=%s finish=%s content_len=%s tool_calls=%s",
                               usage.get("prompt_tokens"), usage.get("completion_tokens"),
                               usage.get("total_tokens"), choice.get("finish_reason"),
                               len(msg.get("content") or ""), len(msg.get("tool_calls") or []),
@@ -829,18 +843,33 @@ jobs:
                       if proc.stderr:
                           log.error("curl stderr=%s", proc.stderr[:1000])
                       last_error = RuntimeError(f"Gonka HTTP {code}: {raw[:800]}")
-                      if not _http_retryable(proc.returncode, code) or attempt == 3:
-                          if code in {"429", "500", "502", "503", "504"} or proc.returncode != 0:
-                              setattr(last_error, "retryable", True)
+                      retryable = _http_retryable(proc.returncode, code) or (
+                          "upstream_saturated" in (raw or "") or "capacity" in (raw or "").lower()
+                      )
+                      # Non-retryable client errors (auth, bad request) — fail fast
+                      if code in {"400", "401", "403", "404"} and "upstream_saturated" not in (raw or ""):
+                          setattr(last_error, "retryable", False)
                           raise last_error
-                      delay = 5 * attempt
-                      log.warning("retryable Gonka HTTP %s; sleeping %ss", code or proc.returncode, delay)
+                      if not retryable:
+                          setattr(last_error, "retryable", False)
+                          raise last_error
+                      setattr(last_error, "retryable", True)
+                      if attempt >= max_attempts:
+                          raise last_error
+                      # Exponential backoff: 5, 10, 20, 40, ... capped at 300s
+                      delay = min(300, 5 * (2 ** min(attempt - 1, 6)))
+                      # Mild jitter so concurrent jobs don't thundering-herd
+                      delay = delay + (attempt % 7)
+                      log.warning(
+                          "retryable Gonka HTTP %s (capacity/transient); sleeping %ss before attempt %s/%s",
+                          code or proc.returncode, delay, attempt + 1, max_attempts,
+                      )
                       time.sleep(delay)
                   finally:
                       Path(payload_path).unlink(missing_ok=True)
                       Path(out_path).unlink(missing_ok=True)
               raise last_error or RuntimeError("Gonka chat failed")
-          
+
           def docker_bash(container_id: str, command: str, timeout_sec: int = 45) -> str:
               timeout_sec = max(1, min(int(timeout_sec or 45), 180))
               client = get_docker_client()
@@ -1147,6 +1176,10 @@ jobs:
           last_turn=""
           stuck=0
           rc=0
+          # Keep resuming through capacity 429s until wall-clock job limit or
+          # a hard non-retryable failure. Only give up after many consecutive
+          # same-turn resumes (credits / prolonged saturation).
+          MAX_STUCK=30
           while true; do
             set +e
             uv run python /tmp/gonka_agent_runner.py 2>&1 | tee -a /tmp/gonka-complete.log
@@ -1168,9 +1201,17 @@ jobs:
               stuck=0
             fi
             last_turn="$turn"
-            if [[ "$stuck" -ge 2 ]]; then
-              echo "no progress at turn ${turn}; giving up"
+            if [[ "$stuck" -ge "$MAX_STUCK" ]]; then
+              echo "no progress at turn ${turn} after ${stuck} resumes; giving up (likely prolonged capacity issues or exhausted credits)"
               break
+            fi
+            # Exit 75 = retryable (capacity). Back off before the next resume so
+            # we do not hammer a saturated upstream.
+            if [[ "$rc" -eq 75 ]]; then
+              backoff=$(( 30 + stuck * 15 ))
+              if [[ "$backoff" -gt 300 ]]; then backoff=300; fi
+              echo "retryable exit 75; sleeping ${backoff}s before resume (stuck=${stuck}/${MAX_STUCK})"
+              sleep "$backoff"
             fi
           done
 
