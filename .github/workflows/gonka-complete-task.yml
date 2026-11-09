@@ -510,16 +510,9 @@ jobs:
                   log.error("CRIU dump failed: %s", err)
                   _unstick_container(cid)
                   return {"ok": False, "error": err, "dt": round(dt, 2)}
-              # Best-effort size from Docker's default checkpoint dir
-              size = 0
-              ckpt_dir = Path(f"/var/lib/docker/containers/{cid}/checkpoints/turn")
-              if ckpt_dir.is_dir():
-                  try:
-                      size = sum(p.stat().st_size for p in ckpt_dir.rglob("*") if p.is_file())
-                  except Exception:
-                      size = 0
-              log.info("CRIU dump ok cid=%s dt=%.1fs bytes=%d", cid[:12], dt, size)
-              return {"ok": True, "dt": round(dt, 2), "bytes": size}
+              # Do not stat /var/lib/docker/containers/... — PermissionError as non-root.
+              log.info("CRIU dump ok cid=%s dt=%.1fs", cid[:12], dt)
+              return {"ok": True, "dt": round(dt, 2), "bytes": 0}
           
           
           def restore_container(cid: str) -> None:
